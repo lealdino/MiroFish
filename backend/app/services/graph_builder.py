@@ -10,8 +10,12 @@ from typing import Dict, Any, List, Optional, Callable
 
 from ..models.task import TaskManager, TaskStatus
 from ..utils.locale import t, get_locale, set_locale
+from ..utils.llm_client import LLMClient
+from ..utils.logger import get_logger
 from .text_processor import TextProcessor
 from .local_graph_store import LocalGraphStore
+
+logger = get_logger('mirofish.graph_builder')
 
 
 @dataclass
@@ -38,6 +42,10 @@ class GraphBuilderService:
         # 保留参数签名以兼容既有调用方
         self.task_manager = TaskManager()
         self.store = LocalGraphStore()
+        try:
+            self.llm = LLMClient()
+        except Exception:
+            self.llm = None
 
     def build_graph_async(
         self,
@@ -141,6 +149,51 @@ class GraphBuilderService:
     def set_ontology(self, graph_id: str, ontology: Dict[str, Any]):
         self.store.set_ontology(graph_id, ontology)
 
+    def _extract_with_llm(self, text: str, ontology: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Use LLM to extract named entities and semantic relationships from a text chunk."""
+        if not self.llm:
+            return None
+
+        entity_types = [e.get("name") for e in ontology.get("entity_types", []) if e.get("name")]
+        types_str = ", ".join(entity_types) if entity_types else "Person, Organization, Event, Location, Concept"
+
+        prompt = f"""You are a knowledge graph extractor for a social simulation system.
+
+Available entity types: {types_str}
+
+Text to analyze:
+{text[:1800]}
+
+Extract named entities and semantic relationships. Return ONLY valid JSON:
+{{
+  "entities": [
+    {{"name": "exact name from text", "type": "one of the available types above", "description": "one sentence about this entity based on the text"}}
+  ],
+  "relationships": [
+    {{"source": "entity name", "target": "entity name", "type": "short_verb_phrase", "fact": "Complete sentence stating the relationship."}}
+  ]
+}}
+
+Rules:
+- Only extract entities that are explicitly named in the text
+- Entity names must appear verbatim in the text
+- Relationship type must be a short verb phrase (e.g. works_for, opposes, supports, located_in, participates_in, reacts_to)
+- Each fact must be a complete, standalone sentence derived from the text
+- Extract 3-15 entities and 2-10 relationships
+- Preserve original language (Chinese names stay Chinese, English names stay English)"""
+
+        try:
+            result = self.llm.chat_json(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=2000,
+            )
+            if isinstance(result, dict) and "entities" in result:
+                return result
+        except Exception as e:
+            logger.warning(f"LLM extraction failed, falling back to regex: {e}")
+        return None
+
     def add_text_batches(
         self,
         graph_id: str,
@@ -151,13 +204,26 @@ class GraphBuilderService:
         episode_ids = []
         total_chunks = max(1, len(chunks))
 
+        graph_data = self.store.load_graph(graph_id)
+        ontology = graph_data.get("ontology", {})
+
         for i in range(0, len(chunks), batch_size):
             batch_chunks = chunks[i:i + batch_size]
             batch_num = i // batch_size + 1
             total_batches = (len(chunks) + batch_size - 1) // batch_size
 
             for chunk in batch_chunks:
-                episode_ids.append(self.store.add_episode(graph_id, chunk))
+                extracted = self._extract_with_llm(chunk, ontology)
+                if extracted:
+                    ep_id = self.store.add_episode_structured(
+                        graph_id,
+                        chunk,
+                        extracted.get("entities", []),
+                        extracted.get("relationships", []),
+                    )
+                else:
+                    ep_id = self.store.add_episode(graph_id, chunk)
+                episode_ids.append(ep_id)
 
             if progress_callback:
                 progress = (i + len(batch_chunks)) / total_chunks
@@ -166,7 +232,6 @@ class GraphBuilderService:
                     progress,
                 )
 
-            # 保留轻微间隔，兼容既有进度节奏
             time.sleep(0.05)
 
         return episode_ids

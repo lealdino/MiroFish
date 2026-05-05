@@ -232,29 +232,126 @@ class LocalGraphStore:
             "updated_at": graph.get("updated_at"),
         }
 
+    def add_episode_structured(
+        self,
+        graph_id: str,
+        text: str,
+        entities: List[Dict[str, Any]],
+        relationships: List[Dict[str, Any]],
+    ) -> str:
+        """Add episode using pre-extracted entities and relationships from LLM."""
+        lock = self._get_lock(graph_id)
+        with lock:
+            graph = self.load_graph(graph_id)
+            episode_id = f"ep_{uuid.uuid4().hex[:12]}"
+            graph["episodes"].append({
+                "episode_id": episode_id,
+                "text": text,
+                "processed": True,
+                "created_at": datetime.now().isoformat(),
+            })
+
+            name_to_id: Dict[str, str] = {}
+            for entity in entities:
+                name = (entity.get("name") or "").strip()
+                if not name:
+                    continue
+                entity_type = entity.get("type") or "Entity"
+                description = (entity.get("description") or "").strip()
+                node_id = self._upsert_node_rich(graph, name, entity_type, description, text)
+                name_to_id[name] = node_id
+                name_to_id[name.lower()] = node_id
+
+            for rel in relationships:
+                src = (rel.get("source") or "").strip()
+                tgt = (rel.get("target") or "").strip()
+                src_id = name_to_id.get(src) or name_to_id.get(src.lower())
+                tgt_id = name_to_id.get(tgt) or name_to_id.get(tgt.lower())
+                if not src_id or not tgt_id or src_id == tgt_id:
+                    continue
+                fact = (rel.get("fact") or "").strip()
+                if not fact:
+                    rel_type = rel.get("type") or "related_to"
+                    fact = f"{src} {rel_type.replace('_', ' ')} {tgt}."
+                self._append_edge(
+                    graph,
+                    src_id,
+                    tgt_id,
+                    edge_name=rel.get("type") or "related_to",
+                    fact=fact,
+                    episode_id=episode_id,
+                )
+
+            self.save_graph(graph_id, graph)
+            return episode_id
+
+    def _upsert_node_rich(
+        self,
+        graph: Dict[str, Any],
+        name: str,
+        entity_type: str,
+        description: str,
+        text: str,
+    ) -> str:
+        """Upsert node with case-insensitive dedup and accumulating summary."""
+        nodes = graph.setdefault("nodes", [])
+        existing = next(
+            (n for n in nodes if n.get("name", "").lower() == name.lower()),
+            None,
+        )
+        if existing:
+            if entity_type and entity_type not in existing.get("labels", []) and entity_type != "Entity":
+                existing.setdefault("labels", []).append(entity_type)
+            if description:
+                old = existing.get("summary", "")
+                if description not in old:
+                    existing["summary"] = (old + " " + description).strip()[:600]
+            return existing["uuid"]
+
+        node_id = f"node_{uuid.uuid4().hex[:12]}"
+        labels = ["Entity", "Node"]
+        if entity_type and entity_type not in labels:
+            labels.append(entity_type)
+
+        nodes.append({
+            "uuid": node_id,
+            "name": name,
+            "labels": labels,
+            "summary": description or self._make_summary(name, text),
+            "attributes": {},
+            "created_at": datetime.now().isoformat(),
+        })
+        return node_id
+
     def search(self, graph_id: str, query: str, limit: int = 10) -> Dict[str, Any]:
-        query_l = (query or "").strip().lower()
+        query_tokens = set(re.findall(r'[\w一-鿿]+', (query or "").lower()))
         data = self.get_graph_data(graph_id)
 
-        if not query_l:
+        if not query_tokens:
             return {
                 "facts": [e.get("fact", "") for e in data["edges"][:limit]],
                 "edges": data["edges"][:limit],
                 "nodes": data["nodes"][:limit],
             }
 
-        matched_nodes = [
-            n for n in data["nodes"]
-            if query_l in (n.get("name", "").lower() + " " + n.get("summary", "").lower())
-        ]
-        matched_edges = [
-            e for e in data["edges"]
-            if query_l in (e.get("fact", "").lower() + " " + e.get("name", "").lower())
-        ]
+        def token_score(text: str) -> int:
+            tokens = set(re.findall(r'[\w一-鿿]+', text.lower()))
+            return len(query_tokens & tokens)
 
-        facts = [e.get("fact", "") for e in matched_edges[:limit]]
+        nodes_scored = sorted(
+            [(token_score(n.get("name", "") + " " + n.get("summary", "")), n) for n in data["nodes"]],
+            key=lambda x: -x[0],
+        )
+        edges_scored = sorted(
+            [(token_score(e.get("fact", "") + " " + e.get("name", "")), e) for e in data["edges"]],
+            key=lambda x: -x[0],
+        )
+
+        matched_nodes = [n for s, n in nodes_scored if s > 0][:limit]
+        matched_edges = [e for s, e in edges_scored if s > 0][:limit]
+
         return {
-            "facts": facts,
-            "edges": matched_edges[:limit],
-            "nodes": matched_nodes[:limit],
+            "facts": [e.get("fact", "") for e in matched_edges],
+            "edges": matched_edges,
+            "nodes": matched_nodes,
         }
