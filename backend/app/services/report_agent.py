@@ -1166,9 +1166,9 @@ class ReportAgent:
         system_prompt = f"{PLAN_SYSTEM_PROMPT}\n\n{get_language_instruction()}"
         user_prompt = PLAN_USER_PROMPT_TEMPLATE.format(
             simulation_requirement=self.simulation_requirement,
-            total_nodes=context.get('graph_statistics', {}).get('total_nodes', 0),
-            total_edges=context.get('graph_statistics', {}).get('total_edges', 0),
-            entity_types=list(context.get('graph_statistics', {}).get('entity_types', {}).keys()),
+            total_nodes=context.get('graph_statistics', {}).get('node_count', 0),
+            total_edges=context.get('graph_statistics', {}).get('edge_count', 0),
+            entity_types=context.get('graph_statistics', {}).get('entity_types', []),
             total_entities=context.get('total_entities', 0),
             related_facts_json=json.dumps(context.get('related_facts', [])[:10], ensure_ascii=False, indent=2),
         )
