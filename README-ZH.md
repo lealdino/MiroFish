@@ -122,9 +122,8 @@ LLM_API_KEY=your_api_key
 LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 LLM_MODEL_NAME=qwen-plus
 
-# Zep Cloud 配置
-# 每月免费额度即可支撑简单使用：https://app.getzep.com/
-ZEP_API_KEY=your_zep_api_key
+# 本地图谱配置
+# 图谱构建完全本地运行，无需云端图谱API密钥
 ```
 
 #### 2. 安装依赖
